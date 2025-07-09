@@ -695,8 +695,10 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
 			continue
 		}
 		root := t[i].root
+		slog.Warn(fmt.Sprintf("root: %+v", root))
 		// ⭐ 这里是路由匹配的核心！
 		value := root.getValue(rPath, c.params, c.skippedNodes, unescape)
+		slog.Warn(fmt.Sprintf("value: %+v", value))
 		if value.params != nil {
 			c.Params = *value.params
 		}
