@@ -147,7 +147,7 @@ func (n *node) incrementChildPrio(pos int) int {
 func (n *node) addRoute(path string, handlers HandlersChain) {
 	fullPath := path
 	n.priority++
-
+	slog.Warn(fmt.Sprintf("n: %s", ToJson(n)))
 	// Empty tree
 	if len(n.path) == 0 && len(n.children) == 0 {
 		n.insertChild(path, fullPath, handlers)
