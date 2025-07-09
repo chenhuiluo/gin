@@ -6,6 +6,8 @@ package gin
 
 import (
 	"bytes"
+	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"unicode"
@@ -107,14 +109,14 @@ const (
 )
 
 type node struct {
-	path      string
-	indices   string
-	wildChild bool
-	nType     nodeType
-	priority  uint32
-	children  []*node // child nodes, at most 1 :param style node at the end of the array
-	handlers  HandlersChain
-	fullPath  string
+	path      string        // 当前节点的路径段
+	indices   string        // 子节点的首字符索引，用户快速查找
+	wildChild bool          // 是否有通配符子节点
+	nType     nodeType      // 节点类型：static/root/param/catchAll
+	priority  uint32        // 优先级，基于注册的路由数量
+	children  []*node       // 子节点列表
+	handlers  HandlersChain // 处理器链，只有叶子节点才有
+	fullPath  string        // 完整路径，用于调试和错误信息
 }
 
 // Increments priority of the given child and reorders if necessary
@@ -157,12 +159,11 @@ func (n *node) addRoute(path string, handlers HandlersChain) {
 
 walk:
 	for {
-		// Find the longest common prefix.
-		// This also implies that the common prefix contains no ':' or '*'
-		// since the existing key can't contain those chars.
+		// 找到当前节点路径和新路径的最长公共前缀
 		i := longestCommonPrefix(path, n.path)
 
-		// Split edge
+		slog.Warn(fmt.Sprintf("path: %s, n.path: %s, i: %d", path, n.path, i))
+		// 情况1：需要分裂当前节点
 		if i < len(n.path) {
 			child := node{
 				path:      n.path[i:],
@@ -175,6 +176,7 @@ walk:
 				fullPath:  n.fullPath,
 			}
 
+			// 更新当前节点
 			n.children = []*node{&child}
 			// []byte for proper unicode char conversion, see #65
 			n.indices = bytesconv.BytesToString([]byte{n.path[i]})
@@ -184,12 +186,12 @@ walk:
 			n.fullPath = fullPath[:parentFullPathIndex+i]
 		}
 
-		// Make new node a child of this node
+		// 情况2：需要继续向下查找或创建新分支
 		if i < len(path) {
 			path = path[i:]
 			c := path[0]
 
-			// '/' after param
+			// 参数节点的特殊处理
 			if n.nType == param && c == '/' && len(n.children) == 1 {
 				parentFullPathIndex += len(n.path)
 				n = n.children[0]
@@ -197,7 +199,7 @@ walk:
 				continue walk
 			}
 
-			// Check if a child with the next path byte exists
+			// 在子节点中查找匹配的首字符
 			for i, max_ := 0, len(n.indices); i < max_; i++ {
 				if c == n.indices[i] {
 					parentFullPathIndex += len(n.path)
@@ -207,22 +209,26 @@ walk:
 				}
 			}
 
-			// Otherwise insert it
+			// 没找到匹配的子节点，需要创建新的
 			if c != ':' && c != '*' && n.nType != catchAll {
-				// []byte for proper unicode char conversion, see #65
+				// 1. 更新父节点的 indices
 				n.indices += bytesconv.BytesToString([]byte{c})
+				// 2. 创建新的子节点
 				child := &node{
 					fullPath: fullPath,
 				}
+				// 3. 添加子节点到父节点
 				n.addChild(child)
+				// 4. 调整优先级
 				n.incrementChildPrio(len(n.indices) - 1)
+				// 5. 移动到新创建的子节点
 				n = child
 			} else if n.wildChild {
-				// inserting a wildcard node, need to check if it conflicts with the existing wildcard
+				// 通配符冲突检查
 				n = n.children[len(n.children)-1]
 				n.priority++
 
-				// Check if the wildcard matches
+				// 检查通配符冲突
 				if len(path) >= len(n.path) && n.path == path[:len(n.path)] &&
 					// Adding a child to a catchAll is not possible
 					n.nType != catchAll &&
@@ -231,7 +237,7 @@ walk:
 					continue walk
 				}
 
-				// Wildcard conflict
+				// 通配符冲突，抛出panic
 				pathSeg := path
 				if n.nType != catchAll {
 					pathSeg, _, _ = strings.Cut(pathSeg, "/")
@@ -248,7 +254,7 @@ walk:
 			return
 		}
 
-		// Otherwise add handle to current node
+		// 情况3：路径完全匹配，检查是否已有处理器
 		if n.handlers != nil {
 			panic("handlers are already registered for path '" + fullPath + "'")
 		}
@@ -296,8 +302,12 @@ func findWildcard(path string) (wildcard string, i int, valid bool) {
 }
 
 func (n *node) insertChild(path string, fullPath string, handlers HandlersChain) {
+	// 这个方法负责：
+	// 1. 处理通配符路径（:param 和 *catchAll）
+	// 2. 创建新的节点
+	// 3. 设置节点的各种属性
 	for {
-		// Find prefix until first wildcard
+		// 查找通配符的位置
 		wildcard, i, valid := findWildcard(path)
 		if i < 0 { // No wildcard found
 			break
@@ -428,14 +438,18 @@ type skippedNode struct {
 func (n *node) getValue(path string, params *Params, skippedNodes *[]skippedNode, unescape bool) (value nodeValue) {
 	var globalParamsCount int16
 
-walk: // Outer loop for walking the tree
+walk: // 外层循环标签，用于goto跳转
 	for {
+		// 三大主要分支：
+		// 1. len(path) > len(prefix) - 路径比节点路径长
+		// 2. path == prefix - 路径完全匹配节点路径
+		// 3. 其他情况 - 路径不匹配，处理TSR和回溯
 		prefix := n.path
+		slog.Warn("prefix", prefix)
 		if len(path) > len(prefix) {
+			// 情况1: 请求路径比当前节点路径长
 			if path[:len(prefix)] == prefix {
-				path = path[len(prefix):]
-
-				// Try all the non-wildcard children first by matching the indices
+				path = path[len(prefix):] // 关键：消费掉匹配的前缀
 				idxc := path[0]
 				for i, c := range []byte(n.indices) {
 					if c == idxc {
@@ -457,15 +471,16 @@ walk: // Outer loop for walking the tree
 								paramsCount: globalParamsCount,
 							}
 						}
-
+						slog.Info(fmt.Sprintf("n.indices: %s, n.child.%d: %s", n.indices, i, ToJson(n.children[i])))
 						n = n.children[i]
 						continue walk
 					}
 				}
-
+				// 如果不是通配符节点，查找静态子节点
 				if !n.wildChild {
 					// If the path at the end of the loop is not equal to '/' and the current node has no child nodes
 					// the current node needs to roll back to last valid skippedNode
+					// 没找到匹配的静态子节点
 					if path != "/" {
 						for length := len(*skippedNodes); length > 0; length-- {
 							skippedNode := (*skippedNodes)[length-1]
@@ -594,10 +609,12 @@ walk: // Outer loop for walking the tree
 			}
 		}
 
-		if path == prefix {
+		if path == prefix { // 进入完全匹配分支
 			// If the current path does not equal '/' and the node does not have a registered handle and the most recently matched node has a child node
 			// the current node needs to roll back to last valid skippedNode
 			if n.handlers == nil && path != "/" {
+				// 这个分支处理的是参数路由的回滚情况
+				// 例如：/user/:id 匹配 /user/123/profile 时可能需要回滚
 				for length := len(*skippedNodes); length > 0; length-- {
 					skippedNode := (*skippedNodes)[length-1]
 					*skippedNodes = (*skippedNodes)[:length-1]
@@ -613,8 +630,7 @@ walk: // Outer loop for walking the tree
 				}
 				//	n = latestNode.children[len(latestNode.children)-1]
 			}
-			// We should have reached the node containing the handle.
-			// Check if this node has a handle registered.
+			// 执行赋值和判断
 			if value.handlers = n.handlers; value.handlers != nil {
 				value.fullPath = n.fullPath
 				return value

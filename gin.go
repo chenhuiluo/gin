@@ -7,6 +7,7 @@ package gin
 import (
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -91,8 +92,9 @@ const (
 
 // Engine is the framework's instance, it contains the muxer, middleware and configuration settings.
 // Create an instance of Engine, by using New() or Default()
+// gin 主要结构
 type Engine struct {
-	RouterGroup
+	RouterGroup // 路由组，继承路由功能
 
 	// RedirectTrailingSlash enables automatic redirection if the current route can't be matched but a
 	// handler for the path with (without) the trailing slash exists.
@@ -166,14 +168,14 @@ type Engine struct {
 
 	delims           render.Delims
 	secureJSONPrefix string
-	HTMLRender       render.HTMLRender
+	HTMLRender       render.HTMLRender // HTML模版
 	FuncMap          template.FuncMap
 	allNoRoute       HandlersChain
 	allNoMethod      HandlersChain
 	noRoute          HandlersChain
-	noMethod         HandlersChain
-	pool             sync.Pool
-	trees            methodTrees
+	noMethod         HandlersChain // 中间件
+	pool             sync.Pool     // 对象池
+	trees            methodTrees   // 路由树
 	maxParams        uint16
 	maxSections      uint16
 	trustedProxies   []string
@@ -240,6 +242,8 @@ func (engine *Engine) Handler() http.Handler {
 }
 
 func (engine *Engine) allocateContext(maxParams uint16) *Context {
+	slog.Warn(fmt.Sprintf("maxParams: %d", maxParams))
+	slog.Warn(fmt.Sprintf("maxSections: %d", engine.maxSections))
 	v := make(Params, 0, maxParams)
 	skippedNodes := make([]skippedNode, 0, engine.maxSections)
 	return &Context{engine: engine, params: &v, skippedNodes: &skippedNodes}
@@ -351,25 +355,32 @@ func (engine *Engine) rebuild405Handlers() {
 	engine.allNoMethod = engine.combineHandlers(engine.noMethod)
 }
 
+// Engine.addRoute() - 添加到路由树
 func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
+	// 验证路径格式
 	assert1(path[0] == '/', "path must begin with '/'")
 	assert1(method != "", "HTTP method can not be empty")
 	assert1(len(handlers) > 0, "there must be at least one handler")
 
 	debugPrintRoute(method, path, handlers)
 
+	// 获取或创建HTTP方法对应的路由树
 	root := engine.trees.get(method)
 	if root == nil {
 		root = new(node)
 		root.fullPath = "/"
 		engine.trees = append(engine.trees, methodTree{method: method, root: root})
 	}
+
+	// 将路由添加到树中
 	root.addRoute(path, handlers)
 
+	// 更新最大参数数量
 	if paramsCount := countParams(path); paramsCount > engine.maxParams {
 		engine.maxParams = paramsCount
 	}
 
+	// 如果是根路径，更新最大参数数量
 	if sectionsCount := countSections(path); sectionsCount > engine.maxSections {
 		engine.maxSections = sectionsCount
 	}
@@ -635,13 +646,17 @@ func (engine *Engine) RunListener(listener net.Listener) (err error) {
 
 // ServeHTTP conforms to the http.Handler interface.
 func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 1. 从对象池获取Context（可能是复用的）
 	c := engine.pool.Get().(*Context)
+	// 2. 重置ResponseWriter，绑定到当前请求的Writer
 	c.writermem.reset(w)
+	// 3. 绑定当前请求
 	c.Request = req
+	// 4. 清理Context状态，为新请求做准备
 	c.reset()
-
+	// 5. 处理请求
 	engine.handleHTTPRequest(c)
-
+	// 6. 请求处理完成，将Context放回对象池供下次复用
 	engine.pool.Put(c)
 }
 
@@ -661,7 +676,9 @@ func (engine *Engine) HandleContext(c *Context) {
 func (engine *Engine) handleHTTPRequest(c *Context) {
 	httpMethod := c.Request.Method
 	rPath := c.Request.URL.Path
+	slog.Warn(fmt.Sprintf("method: %s, path: %s", httpMethod, rPath))
 	unescape := false
+	// 路径预处理
 	if engine.UseRawPath && len(c.Request.URL.RawPath) > 0 {
 		rPath = c.Request.URL.RawPath
 		unescape = engine.UnescapePathValues
@@ -671,25 +688,27 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
 		rPath = cleanPath(rPath)
 	}
 
-	// Find root of the tree for the given HTTP method
+	// 根据HTTP方法找到对应的路由树
 	t := engine.trees
 	for i, tl := 0, len(t); i < tl; i++ {
 		if t[i].method != httpMethod {
 			continue
 		}
 		root := t[i].root
-		// Find route in tree
+		// ⭐ 这里是路由匹配的核心！
 		value := root.getValue(rPath, c.params, c.skippedNodes, unescape)
 		if value.params != nil {
 			c.Params = *value.params
 		}
 		if value.handlers != nil {
+			// ⭐ 找到匹配的路由，设置处理函数链
 			c.handlers = value.handlers
 			c.fullPath = value.fullPath
-			c.Next()
+			c.Next() // ⭐ 执行处理函数链
 			c.writermem.WriteHeaderNow()
 			return
 		}
+		// 处理尾部斜杠重定向 (TSR)
 		if httpMethod != http.MethodConnect && rPath != "/" {
 			if value.tsr && engine.RedirectTrailingSlash {
 				redirectTrailingSlash(c)
@@ -702,6 +721,7 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
 		break
 	}
 
+	// 处理 405 Method Not Allowed
 	if engine.HandleMethodNotAllowed && len(t) > 0 {
 		// According to RFC 7231 section 6.5.5, MUST generate an Allow header field in response
 		// containing a list of the target resource's currently supported methods.
@@ -721,7 +741,7 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
 			return
 		}
 	}
-
+	// 处理 404 Not Found
 	c.handlers = engine.allNoRoute
 	serveError(c, http.StatusNotFound, default404Body)
 }

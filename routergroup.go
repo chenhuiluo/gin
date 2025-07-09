@@ -5,6 +5,8 @@
 package gin
 
 import (
+	"fmt"
+	"log/slog"
 	"net/http"
 	"path"
 	"regexp"
@@ -84,8 +86,12 @@ func (group *RouterGroup) BasePath() string {
 }
 
 func (group *RouterGroup) handle(httpMethod, relativePath string, handlers HandlersChain) IRoutes {
+	// 步骤1：计算绝对路径
 	absolutePath := group.calculateAbsolutePath(relativePath)
+	slog.Warn(fmt.Sprintf("absolutePath:%s, relativePath:%s", absolutePath, relativePath))
+	// 步骤2：合并处理链（中间件+处理函数）
 	handlers = group.combineHandlers(handlers)
+	// 步骤3：将路由注册到引擎
 	group.engine.addRoute(httpMethod, absolutePath, handlers)
 	return group.returnObj()
 }
@@ -239,11 +245,12 @@ func (group *RouterGroup) createStaticHandler(relativePath string, fs http.FileS
 }
 
 func (group *RouterGroup) combineHandlers(handlers HandlersChain) HandlersChain {
+	slog.Warn(fmt.Sprintf("handlers.length is %d", len(handlers)))
 	finalSize := len(group.Handlers) + len(handlers)
 	assert1(finalSize < int(abortIndex), "too many handlers")
 	mergedHandlers := make(HandlersChain, finalSize)
-	copy(mergedHandlers, group.Handlers)
-	copy(mergedHandlers[len(group.Handlers):], handlers)
+	copy(mergedHandlers, group.Handlers)                 // 1. 先复制路由组的中间件
+	copy(mergedHandlers[len(group.Handlers):], handlers) // 2. 再复制当前路由的处理函数
 	return mergedHandlers
 }
 

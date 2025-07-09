@@ -6,6 +6,8 @@ package gin
 
 import (
 	"encoding/xml"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
@@ -131,6 +133,9 @@ func joinPaths(absolutePath, relativePath string) string {
 	}
 
 	finalPath := path.Join(absolutePath, relativePath)
+	defer func() {
+		slog.Warn(fmt.Sprintf("final path: %s", finalPath))
+	}()
 	if lastChar(relativePath) == '/' && lastChar(finalPath) != '/' {
 		return finalPath + "/"
 	}
