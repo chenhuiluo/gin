@@ -145,9 +145,12 @@ func (n *node) incrementChildPrio(pos int) int {
 // addRoute adds a node with the given handle to the path.
 // Not concurrency-safe!
 func (n *node) addRoute(path string, handlers HandlersChain) {
+	slog.Warn(fmt.Sprintf("n: %+v", n))
+	defer func() {
+		slog.Warn(fmt.Sprintf("n: %+v", n))
+	}()
 	fullPath := path
 	n.priority++
-	slog.Warn(fmt.Sprintf("n: %+v", n))
 	// Empty tree
 	if len(n.path) == 0 && len(n.children) == 0 {
 		n.insertChild(path, fullPath, handlers)
